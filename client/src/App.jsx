@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { io } from "socket.io-client";
+import { encryptMessage, decryptMessage, deriveRoomId } from "./crypto";
 
 const SERVER_URL = import.meta.env.VITE_SERVER_URL || "http://localhost:3000";
 
@@ -25,6 +26,7 @@ function initials(name) {
 // ---------- Landing screen ----------
 function Landing({ onEnter }) {
   const [name, setName] = useState(() => localStorage.getItem("name") || "");
+  const [room, setRoom] = useState("");
   const [typed, setTyped] = useState("");
   const full = "pingo";
 
@@ -34,14 +36,15 @@ function Landing({ onEnter }) {
       i += 1;
       setTyped(full.slice(0, i));
       if (i >= full.length) clearInterval(id);
-    }, 90);
+    }, 110);
     return () => clearInterval(id);
   }, []);
 
   const go = () => {
     const n = name.trim();
-    if (!n) return;
-    onEnter(n);
+    const r = room.trim();
+    if (!n || !r) return;
+    onEnter(n, r);
   };
 
   return (
@@ -57,7 +60,7 @@ function Landing({ onEnter }) {
           {typed}
           <span className="caret">█</span>
         </h1>
-        <p className="tagline">A real-time chat console. Pick a handle and jump in.</p>
+        <p className="tagline">End-to-end encrypted chat. Share a room key to talk privately.</p>
 
         <div className="enter-card">
           <label className="enter-label">$ whoami</label>
@@ -73,15 +76,34 @@ function Landing({ onEnter }) {
               autoFocus
             />
           </div>
-          <button className="enter-btn" onClick={go} disabled={!name.trim()}>
+
+          <label className="enter-label" style={{ marginTop: 14 }}>🔐 room key (shared passphrase)</label>
+          <div className="enter-row">
+            <span className="enter-prompt">#</span>
+            <input
+              className="enter-input"
+              type="password"
+              placeholder="a secret only your group knows…"
+              value={room}
+              onChange={(e) => setRoom(e.target.value)}
+              onKeyDown={(e) => e.key === "Enter" && go()}
+              maxLength={128}
+            />
+          </div>
+
+          <button className="enter-btn" onClick={go} disabled={!name.trim() || !room.trim()}>
             connect <span className="arrow">→</span>
           </button>
+          <p className="enter-hint">
+            Everyone using the same room key sees each other's messages. The server only
+            ever stores ciphertext — it can't read them.
+          </p>
         </div>
 
         <div className="features">
-          <span>⚡ live messaging</span>
-          <span>👥 see who's online</span>
-          <span>🔒 rate-limited &amp; validated</span>
+          <span>🔒 AES-256-GCM</span>
+          <span>🔑 PBKDF2 key derivation</span>
+          <span>🙈 zero-knowledge server</span>
         </div>
       </div>
     </div>
@@ -89,9 +111,9 @@ function Landing({ onEnter }) {
 }
 
 // ---------- Chat screen ----------
-function Chat({ username, onLeave }) {
+function Chat({ username, roomKey, onLeave }) {
   const [text, setText] = useState("");
-  const [chat, setChat] = useState([]);
+  const [chat, setChat] = useState([]); // [{id, user, text, time, ok}]
   const [online, setOnline] = useState([]);
   const [typingUser, setTypingUser] = useState("");
   const [rateError, setRateError] = useState("");
@@ -101,11 +123,29 @@ function Chat({ username, onLeave }) {
   const typingTimeout = useRef(null);
   const me = username.trim() || "Me";
 
+  // Decrypt one incoming server message into a display object.
+  const decryptIncoming = async (m) => {
+    try {
+      const text = await decryptMessage(roomKey, m.cipher);
+      return { id: m.id, user: m.user, text, time: m.time, ok: true };
+    } catch {
+      // Wrong room key or tampered: show a locked placeholder instead of crashing.
+      return { id: m.id, user: m.user, text: "🔒 encrypted — different room key", time: m.time, ok: false };
+    }
+  };
+
   useEffect(() => {
     const onConnect = () => setConnected(true);
     const onDisconnect = () => setConnected(false);
-    const onHistory = (msgs) => setChat(msgs);
-    const onMessage = (msg) => setChat((prev) => [...prev, msg]);
+
+    const onHistory = async (msgs) => {
+      const decrypted = await Promise.all(msgs.map(decryptIncoming));
+      setChat(decrypted);
+    };
+    const onMessage = async (m) => {
+      const d = await decryptIncoming(m);
+      setChat((prev) => [...prev, d]);
+    };
     const onOnline = (users) => setOnline(users);
     const onTyping = (name) => {
       setTypingUser(name);
@@ -125,8 +165,14 @@ function Chat({ username, onLeave }) {
     socket.on("typing", onTyping);
     socket.on("error:rate", onRate);
 
-    socket.emit("setName", me);
-    socket.emit("history:request");
+    // Derive a non-reversible room id from the passphrase and join that room.
+    // The server only ever receives the hash, never the passphrase itself.
+    const joinRoom = async () => {
+      const roomId = await deriveRoomId(roomKey);
+      socket.emit("join", { roomId, name: me });
+    };
+    if (socket.connected) joinRoom();
+    socket.on("connect", joinRoom);
 
     return () => {
       socket.off("connect", onConnect);
@@ -136,9 +182,11 @@ function Chat({ username, onLeave }) {
       socket.off("online", onOnline);
       socket.off("typing", onTyping);
       socket.off("error:rate", onRate);
+      socket.off("connect", joinRoom);
       if (typingTimeout.current) clearTimeout(typingTimeout.current);
     };
-  }, [me]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [me, roomKey]);
 
   useEffect(() => {
     listRef.current?.scrollTo({ top: listRef.current.scrollHeight, behavior: "smooth" });
@@ -149,11 +197,17 @@ function Chat({ username, onLeave }) {
     if (me) socket.emit("typing", me);
   };
 
-  const send = () => {
+  const send = async () => {
     const t = text.trim();
     if (!t) return;
-    socket.emit("chat:message", { user: me, message: t });
-    setText("");
+    try {
+      const cipher = await encryptMessage(roomKey, t);
+      socket.emit("chat:message", { user: me, cipher });
+      setText("");
+    } catch {
+      setRateError("Encryption failed — message not sent.");
+      setTimeout(() => setRateError(""), 3000);
+    }
   };
 
   const handleKey = (e) => {
@@ -190,6 +244,7 @@ function Chat({ username, onLeave }) {
             <span className={`dot ${connected ? "on" : "off"}`} />
             {connected ? "connected" : "connecting…"}
           </div>
+          <div className="side-enc">🔒 end-to-end encrypted</div>
 
           <div className="side-label">online — {uniqueOnline.length}</div>
           <div className="side-users">
@@ -213,7 +268,7 @@ function Chat({ username, onLeave }) {
 
         <main className="main">
           <header className="bar">
-            <div className="bar-title"># general</div>
+            <div className="bar-title"># encrypted room</div>
             <div className="status">
               <span className="count">{uniqueOnline.length} online</span>
             </div>
@@ -222,8 +277,8 @@ function Chat({ username, onLeave }) {
           <div ref={listRef} className="stream">
             {grouped.length === 0 && (
               <div className="empty">
-                <div className="empty-art">&gt;_</div>
-                <p>No messages yet. Say something to get started.</p>
+                <div className="empty-art">🔒</div>
+                <p>No messages yet. Anything you send is encrypted before it leaves your browser.</p>
               </div>
             )}
             {grouped.map((m) => (
@@ -245,7 +300,7 @@ function Chat({ username, onLeave }) {
                       </span>
                     </div>
                   )}
-                  <div className="bubble">{m.message}</div>
+                  <div className={`bubble ${m.ok ? "" : "locked"}`}>{m.text}</div>
                 </div>
               </div>
             ))}
@@ -268,7 +323,7 @@ function Chat({ username, onLeave }) {
             <div className="msg-row">
               <textarea
                 className="msg-input"
-                placeholder="Type a message — Enter to send, Shift+Enter for newline"
+                placeholder="Type a message — it's encrypted before sending"
                 value={text}
                 onChange={handleTyping}
                 onKeyDown={handleKey}
@@ -287,11 +342,13 @@ function Chat({ username, onLeave }) {
 // ---------- Root ----------
 export default function App() {
   const [username, setUsername] = useState("");
+  const [roomKey, setRoomKey] = useState("");
   const [entered, setEntered] = useState(false);
   const [leaving, setLeaving] = useState(false);
 
-const enter = (name) => {
+  const enter = (name, room) => {
     setUsername(name);
+    setRoomKey(room);
     localStorage.setItem("name", name);
     if (!socket.connected) socket.connect();
     setLeaving(true);
@@ -300,6 +357,7 @@ const enter = (name) => {
 
   const leave = () => {
     socket.disconnect();
+    setRoomKey("");
     setEntered(false);
     setLeaving(false);
   };
@@ -313,7 +371,7 @@ const enter = (name) => {
         </div>
       ) : (
         <div className="fade-in">
-          <Chat username={username} onLeave={leave} />
+          <Chat username={username} roomKey={roomKey} onLeave={leave} />
         </div>
       )}
     </div>
@@ -322,40 +380,19 @@ const enter = (name) => {
 
 const css = `
 :root {
-  --bg: #0b0f14;
-  --panel: #11161d;
-  --panel-2: #161d26;
-  --line: #1f2937;
-  --text: #e5e9f0;
-  --muted: #7c8896;
-  --accent: #6ee7b7;
+  --bg: #0b0f14; --panel: #11161d; --panel-2: #161d26; --line: #1f2937;
+  --text: #e5e9f0; --muted: #7c8896; --accent: #6ee7b7;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 * { box-sizing: border-box; }
-.app {
-  min-height: 100dvh;
-  display: grid;
-  place-items: center;
-  background: var(--bg);
-  color: var(--text);
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  overflow: hidden;
-}
-
+.app { min-height: 100dvh; display: grid; place-items: center; background: var(--bg); color: var(--text); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; overflow: hidden; }
 .fade-out { animation: fadeOut 0.6s ease forwards; }
 .fade-in { animation: fadeIn 0.6s ease; width: 100%; display: grid; place-items: center; }
 @keyframes fadeOut { to { opacity: 0; transform: scale(0.96); } }
 @keyframes fadeIn { from { opacity: 0; transform: scale(1.02); } to { opacity: 1; transform: none; } }
 
 .landing { position: relative; width: 100dvw; height: 100dvh; display: grid; place-items: center; overflow: hidden; }
-.grid-bg {
-  position: absolute; inset: 0;
-  background-image: linear-gradient(#1b2735 1px, transparent 1px), linear-gradient(90deg, #1b2735 1px, transparent 1px);
-  background-size: 44px 44px;
-  mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 30%, transparent 75%);
-  -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 30%, transparent 75%);
-  animation: drift 22s linear infinite; opacity: 0.5;
-}
+.grid-bg { position: absolute; inset: 0; background-image: linear-gradient(#1b2735 1px, transparent 1px), linear-gradient(90deg, #1b2735 1px, transparent 1px); background-size: 44px 44px; mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 30%, transparent 75%); -webkit-mask-image: radial-gradient(ellipse 70% 60% at 50% 45%, #000 30%, transparent 75%); animation: drift 22s linear infinite; opacity: 0.5; }
 @keyframes drift { from { background-position: 0 0, 0 0; } to { background-position: 44px 44px, 44px 44px; } }
 .scanline { position: absolute; left: 0; right: 0; height: 140px; background: linear-gradient(180deg, transparent, #6ee7b714, transparent); animation: scan 6s linear infinite; pointer-events: none; }
 @keyframes scan { from { top: -140px; } to { top: 100%; } }
@@ -377,24 +414,20 @@ const css = `
 .enter-row:focus-within { border-color: var(--accent); }
 .enter-prompt { font-family: var(--mono); color: var(--accent); }
 .enter-input { flex: 1; background: transparent; border: none; outline: none; color: var(--text); font-family: var(--mono); font-size: 15px; }
-.enter-btn { margin-top: 14px; width: 100%; padding: 12px; border: none; border-radius: 10px; font-size: 15px; font-weight: 700; cursor: pointer; color: #fff; background: linear-gradient(180deg, #2563eb, #1d4ed8); transition: transform 0.1s ease, opacity 0.15s ease, box-shadow 0.2s ease; }
+.enter-btn { margin-top: 16px; width: 100%; padding: 12px; border: none; border-radius: 10px; font-size: 15px; font-weight: 700; cursor: pointer; color: #fff; background: linear-gradient(180deg, #2563eb, #1d4ed8); transition: transform 0.1s ease, opacity 0.15s ease, box-shadow 0.2s ease; }
 .enter-btn:hover:not(:disabled) { transform: translateY(-2px); box-shadow: 0 8px 24px #2563eb55; }
 .enter-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .enter-btn .arrow { transition: transform 0.15s ease; display: inline-block; }
 .enter-btn:hover:not(:disabled) .arrow { transform: translateX(4px); }
+.enter-hint { font-size: 11px; color: var(--muted); margin: 12px 2px 0; line-height: 1.5; }
 .features { display: flex; flex-wrap: wrap; gap: 14px; justify-content: center; margin-top: 24px; font-size: 12px; color: var(--muted); font-family: var(--mono); }
 
 .chat-screen { width: 100%; display: grid; place-items: center; padding: 16px; }
-.shell {
-  width: 100%; max-width: 1180px; height: min(90dvh, 940px);
-  display: grid; grid-template-columns: 280px 1fr;
-  background: var(--panel); border: 1px solid var(--line); border-radius: 16px;
-  overflow: hidden; box-shadow: 0 24px 60px #00000066;
-}
-
+.shell { width: 100%; max-width: 1180px; height: min(90dvh, 940px); display: grid; grid-template-columns: 280px 1fr; background: var(--panel); border: 1px solid var(--line); border-radius: 16px; overflow: hidden; box-shadow: 0 24px 60px #00000066; }
 .sidebar { display: flex; flex-direction: column; background: var(--panel-2); border-right: 1px solid var(--line); padding: 16px 14px; }
 .side-head { display: flex; align-items: center; gap: 10px; padding-bottom: 14px; border-bottom: 1px solid var(--line); }
-.side-status { display: flex; align-items: center; gap: 8px; font-size: 12px; font-family: var(--mono); color: var(--muted); padding: 12px 2px; }
+.side-status { display: flex; align-items: center; gap: 8px; font-size: 12px; font-family: var(--mono); color: var(--muted); padding: 12px 2px 4px; }
+.side-enc { font-size: 11px; font-family: var(--mono); color: var(--accent); padding: 0 2px 12px; }
 .side-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--muted); font-family: var(--mono); margin: 6px 2px 8px; }
 .side-users { flex: 1; overflow-y: auto; display: flex; flex-direction: column; gap: 2px; }
 .side-users::-webkit-scrollbar { width: 6px; }
@@ -410,7 +443,6 @@ const css = `
 .stat-label { font-size: 11px; color: var(--muted); }
 .leave-btn { background: #0e141b; border: 1px solid var(--line); color: var(--muted); font-family: var(--mono); font-size: 12px; padding: 7px 14px; border-radius: 9px; cursor: pointer; transition: all 0.15s; }
 .leave-btn:hover { border-color: #7f1d1d; color: #fca5a5; }
-
 .main { display: flex; flex-direction: column; min-width: 0; }
 .bar { display: flex; align-items: center; justify-content: space-between; padding: 16px 20px; border-bottom: 1px solid var(--line); }
 .bar-title { font-family: var(--mono); font-size: 15px; font-weight: 700; }
@@ -423,8 +455,8 @@ const css = `
 .stream { flex: 1; overflow-y: auto; padding: 22px 28px; display: flex; flex-direction: column; gap: 6px; scroll-behavior: smooth; }
 .stream::-webkit-scrollbar { width: 8px; }
 .stream::-webkit-scrollbar-thumb { background: #232c38; border-radius: 8px; }
-.empty { margin: auto; text-align: center; color: var(--muted); }
-.empty-art { font-family: var(--mono); font-size: 32px; color: var(--accent); opacity: 0.6; margin-bottom: 8px; }
+.empty { margin: auto; text-align: center; color: var(--muted); max-width: 320px; }
+.empty-art { font-size: 32px; opacity: 0.7; margin-bottom: 8px; }
 .line { display: flex; gap: 10px; align-items: flex-end; animation: rise 0.18s ease-out; }
 .line.mine { flex-direction: row-reverse; }
 @keyframes rise { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
@@ -435,6 +467,7 @@ const css = `
 .who { font-size: 11px; color: var(--muted); margin: 0 4px 3px; font-family: var(--mono); display: flex; gap: 8px; }
 .time { opacity: 0.6; }
 .bubble { padding: 9px 13px; border-radius: 14px; line-height: 1.45; font-size: 14px; background: var(--panel-2); border: 1px solid var(--line); word-break: break-word; white-space: pre-wrap; }
+.bubble.locked { font-style: italic; color: var(--muted); font-family: var(--mono); font-size: 13px; }
 .line.theirs .bubble { border-top-left-radius: 4px; }
 .line.mine .bubble { background: linear-gradient(180deg, #2563eb, #1d4ed8); border-color: #2f6bff; border-top-right-radius: 4px; color: #fff; }
 .bubble.typing { display: flex; gap: 4px; padding: 12px 14px; }
@@ -450,7 +483,6 @@ const css = `
 .send { width: 44px; height: 44px; flex-shrink: 0; border: none; border-radius: 12px; cursor: pointer; font-size: 18px; font-weight: 700; color: #fff; background: linear-gradient(180deg, #2563eb, #1d4ed8); transition: transform 0.08s ease, opacity 0.15s ease; }
 .send:hover:not(:disabled) { transform: translateY(-1px); }
 .send:disabled { opacity: 0.4; cursor: not-allowed; }
-
 @media (max-width: 760px) {
   .chat-screen { padding: 0; }
   .shell { grid-template-columns: 1fr; height: 100dvh; border-radius: 0; border: none; }
