@@ -102,7 +102,12 @@ function Landing({ onEnter }) {
           <p className="enc-note">Messages are end-to-end encrypted. The server only ever sees scrambled text.</p>
         </div>
 
-        <footer className="landing-foot">Built by Joel Jose</footer>
+        <footer className="landing-foot">
+          © 2026 Pingo · Built by Joel Jose{" "}
+          <a className="gh-link" href="https://github.com/iamjoeljose" target="_blank" rel="noopener noreferrer">
+            @iamjoeljose
+          </a>
+        </footer>
       </div>
     </div>
   );
@@ -335,6 +340,12 @@ function Chat({ username, roomKey, onLeave }) {
               />
               <button className="send" onClick={send} disabled={!text.trim()} aria-label="Send message">↑</button>
             </div>
+            <div className="chat-copyright">
+              © 2026 Pingo · Built by Joel Jose{" "}
+              <a className="gh-link" href="https://github.com/iamjoeljose" target="_blank" rel="noopener noreferrer">
+                @iamjoeljose
+              </a>
+            </div>
           </footer>
         </main>
 
@@ -463,6 +474,9 @@ const css = `
 .enter-btn:hover:not(:disabled) .arrow { transform: translateX(4px); }
 .enc-note { text-align: center; font-size: 13px; color: var(--muted); margin: 22px auto 0; line-height: 1.55; }
 .landing-foot { text-align: center; font-size: 12px; color: var(--muted); margin-top: 26px; font-family: var(--mono); opacity: 0.7; }
+.gh-link { color: var(--accent); text-decoration: none; transition: opacity 0.15s; }
+.gh-link:hover { text-decoration: underline; }
+.chat-copyright { text-align: center; font-size: 11px; color: var(--muted); font-family: var(--mono); margin-top: 8px; opacity: 0.6; }
 
 /* ---------------- CHAT ---------------- */
 .chat-screen { width: 100%; display: grid; place-items: center; padding: 16px; }
