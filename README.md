@@ -1,4 +1,4 @@
-# A quick Chat Initiative by JJ
+
 # Pingo
 
 A real-time group chat room built with **React 19 + Vite** on the client and **Express 5 + Socket.IO** on the server. Multiple people join a shared channel, pick a handle, and message each other live — with an online-user list and typing indicators.
